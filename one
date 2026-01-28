@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+import glob
+import re
+import subprocess
+import time
+import serial
+
+# ---- keep YOUR known-good paths (from live_manual.py) ----
+MODEL_PATH = "/mnt/usb/projects/data/models/mnist_cnn.pth"
+IMAGE_PATH = "/mnt/usb/projects/data/images/digit.jpg"
+
+# ---- keep YOUR known-good flags (from live_manual.py) ----
+INVERT = True          # True = add --invert
+USE_MNIST_NORM = True  # False = add --no-mnist-norm
+
+# ---- new behavior ----
+TARGET_DIGIT = 3
+CONF_THRESHOLD = 0.90      # 0.90 = 90%  (raise if you want)
+READ_EVERY_SEC = 5
+MOTOR_ON_SEC = 4
+
+BAUD = 115200
+
+
+def find_arduino_port():
+    ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
+    return ports[0] if ports else None
+
+
+def send_off(ser):
+    try:
+        ser.write(b"OFF\n")
+        ser.flush()
+    except Exception:
+        pass
+
+
+def motor_on_for(ser, seconds):
+    ser.write(b"ON\n")
+    ser.flush()
+    time.sleep(seconds)
+    send_off(ser)
+
+
+def run_capture():
+    cmd = ["rpicam-still", "--zsl", "-o", IMAGE_PATH]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print("CAPTURE FAILED")
+        if r.stderr.strip():
+            print(r.stderr.strip())
+        return False
+    return True
+
+
+def run_infer_and_parse():
+    # This call is the SAME idea as your live_manual.py (same script + flags).
+    cmd = [
+        "python",
+        "/mnt/usb/projects/mnist/infer_mnist_from_image.py",
+        IMAGE_PATH,
+        "--model", MODEL_PATH,
+        "--topk", "3",   # keep top3 available; we will only PRINT the top1 ourselves
+    ]
+
+    if INVERT:
+        cmd.append("--invert")
+    if not USE_MNIST_NORM:
+        cmd.append("--no-mnist-norm")
+
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+
+    # Parse this line printed by infer_mnist_from_image.py:
+    # "Prediction: 3 confidence: 94.82 %"
+    m = re.search(r"Prediction:\s*([0-9])\s+confidence:\s*([0-9]+(?:\.[0-9]+)?)\s*%", out)
+    if not m:
+        return None, None
+
+    pred = int(m.group(1))
+    conf_pct = float(m.group(2))
+    conf = conf_pct / 100.0
+    return pred, conf
+
+
+def main():
+    port = find_arduino_port()
+    if not port:
+        print("ERROR: Arduino not found on /dev/ttyACM* or /dev/ttyUSB*")
+        return
+
+    ser = serial.Serial(port, BAUD, timeout=1)
+    time.sleep(2)      # Arduino resets when serial opens
+    send_off(ser)      # start safe
+
+    print("Auto live mode.")
+    print(f"Every {READ_EVERY_SEC}s | target={TARGET_DIGIT} | motor={MOTOR_ON_SEC}s | thr={CONF_THRESHOLD*100:.1f}%")
+    print("Arduino:", port)
+
+    try:
+        while True:
+            cycle_start = time.time()
+
+            if not run_capture():
+                time.sleep(READ_EVERY_SEC)
+                continue
+
+            # small delay like your manual script
+            time.sleep(0.05)
+
+            pred, conf = run_infer_and_parse()
+            if pred is None:
+                print("Prediction: (parse failed)")
+            else:
+                print(f"Prediction: {pred} confidence: {conf*100:.2f} %")
+
+                if pred == TARGET_DIGIT and conf >= CONF_THRESHOLD:
+                    print("target is detected")
+                    motor_on_for(ser, MOTOR_ON_SEC)
+
+            # keep a steady 5s cycle (best-effort)
+            elapsed = time.time() - cycle_start
+            sleep_time = READ_EVERY_SEC - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        send_off(ser)
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
